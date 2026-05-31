@@ -44,7 +44,7 @@
 
 | Файл / Модуль | Призначення |
 |---|---|
-| `meteostation.ino` | Головний файл прошивки ESP32 |
+| `ESP_Weather_station.ino` | Головний файл прошивки ESP32 |
 | `index_html[]` (PROGMEM) | Вбудований HTML/CSS/JS веб-інтерфейс (SPA) |
 | `handleRoot()` | Обробник HTTP GET `/` — повертає веб-сторінку |
 | `handleData()` | Обробник HTTP GET `/data` — повертає JSON з поточними даними та статистикою |
