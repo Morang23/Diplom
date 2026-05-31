@@ -1,0 +1,671 @@
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <WebServer.h>
+#include <WiFiManager.h>
+
+// === ДОДАНО ДЛЯ ЧАСУ ===
+#include <time.h>
+
+// === ДОДАНО ДЛЯ FIREBASE (ПОЧАТОК) ===
+#include <Firebase_ESP_Client.h>
+#include <addons/TokenHelper.h>
+#include <addons/RTDBHelper.h>
+
+#define API_KEY "CI1HgaGy3ySiWbN7IGJT6k5wofghsUCV3biLorlX" // Вставте сюди скопійований Database Secret
+// УВАГА: URL має бути БЕЗ https:// та БЕЗ слеша в кінці!
+#define DATABASE_URL "weather-station-619b1-default-rtdb.europe-west1.firebasedatabase.app"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+bool signupOK = false;
+// === ДОДАНО ДЛЯ FIREBASE (КІНЕЦЬ) ===
+
+// --- НАЛАШТУВАННЯ ПІНІВ ---
+#define RAIN_PIN 34 
+#define LED_PIN 2
+
+// --- ДАНІ MQTT ---
+const char* mqtt_server = "broker.hivemq.com";
+const char* t_telemetry = "diploma/maksym/telemetry";
+const char* t_state = "diploma/maksym/state";
+
+WiFiClient espClient;
+PubSubClient mqtt(espClient);
+WebServer server(80);
+Adafruit_BME280 bme;
+
+// --- ЗМІННІ ДЛЯ СТАТИСТИКИ ТА ЧАСУ ---
+unsigned long prevMillis = 0;
+unsigned long prevHistMillis = 0;
+
+float minT = 100.0, maxT = -100.0;
+float minH = 100.0, maxH = -1.0;
+float minP = 2000.0, maxP = -1.0;
+int minR = 5000, maxR = -1; 
+
+double sumT = 0, sumH = 0, sumP = 0, sumR = 0;
+unsigned long countReads = 0;
+
+float histT[24];
+float histH[24];
+float histP[24];
+int histR[24];
+
+int getRain() {
+  int raw = analogRead(RAIN_PIN);
+  int inv = 4095 - raw;
+  return (inv < 0) ? 0 : inv;
+}
+
+// === ДОДАНО: Функція для отримання точного часу ===
+String getTimeString() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return "Time_Syncing"; // Поки час не синхронізувався
+  }
+  char timeStringBuff[30];
+  // Формат Година:Хвилина:Секунда (наприклад 18:09:05)
+  // Якщо захочете додати дату, змініть на "%Y-%m-%d %H:%M:%S"
+  strftime(timeStringBuff, sizeof(timeStringBuff), "%H:%M:%S", &timeinfo);
+  return String(timeStringBuff);
+}
+
+// ==============================================================================
+// ВЕБ-ІНТЕРФЕЙС
+// ==============================================================================
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Метеостанція</title>
+  <style>
+    :root {
+      --bg-color: #f5f5f7;
+      --card-bg: #ffffff;
+      --text-main: #1d1d1f;
+      --text-muted: #86868b;
+      --tabs-bg: #e3e3e8;
+      --border-color: #e5e5ea;
+      --tooltip-bg: rgba(255,255,255,0.9);
+      --tooltip-text: #000;
+    }
+    
+    [data-theme="dark"] {
+      --bg-color: #000000;
+      --card-bg: #1c1c1e;
+      --text-main: #f5f5f7;
+      --text-muted: #98989d;
+      --tabs-bg: #2c2c2e;
+      --border-color: #38383a;
+      --tooltip-bg: rgba(0,0,0,0.85);
+      --tooltip-text: #fff;
+    }
+    
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg-color); color: var(--text-main); margin: 0; padding: 20px 10px; -webkit-font-smoothing: antialiased; transition: background-color 0.4s ease, color 0.4s ease; }
+    .card, .tabs, .tab-slider, .stat-item, h1 { transition: background-color 0.4s ease, color 0.4s ease, border-color 0.4s ease, box-shadow 0.4s ease; }
+    
+    .title-container { position: relative; text-align: center; margin-bottom: 25px; max-width: 900px; margin-left: auto; margin-right: auto;}
+    h1 { 
+      font-size: 34px; 
+      font-weight: 800; 
+      margin: 0; 
+      letter-spacing: -1px; 
+      background: linear-gradient(135deg, #97bcf5, #eabcf6);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      display: inline-block;
+    }
+    .theme-switch {
+      position: absolute;
+      right: 10px;
+      top: 0;
+      bottom: 0;
+      margin: auto;
+      height: 34px;
+      font-size: 24px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: transform 0.4s cubic-bezier(0.25, 1, 0.5, 1);
+    }
+    
+    .tabs-container { display: flex; justify-content: center; margin-bottom: 30px; }
+    .tabs { position: relative; display: flex; background: var(--tabs-bg); border-radius: 20px; padding: 4px; gap: 4px; z-index: 1; }
+    
+    .tab-slider { 
+      position: absolute; 
+      top: 4px; 
+      left: 4px; 
+      height: calc(100% - 8px); 
+      background: var(--card-bg); 
+      border-radius: 16px; 
+      box-shadow: 0 2px 8px rgba(0,0,0,0.12); 
+      transition: transform 0.4s cubic-bezier(0.25, 0.8, 0.25, 1), width 0.4s cubic-bezier(0.25, 0.8, 0.25, 1); 
+      z-index: -1; 
+    }
+    
+    .tab { position: relative; padding: 8px 24px; cursor: pointer; font-weight: 600; font-size: 15px; color: var(--text-muted); border: none; background: transparent; z-index: 2; }
+    .tab.active { color: var(--text-main); }
+    
+    @keyframes fadeSlideUp {
+      from { opacity: 0; transform: translateY(15px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .tab-content { display: none; flex-direction: column; align-items: center; gap: 20px; max-width: 900px; margin: 0 auto; }
+    .tab-content.active { display: flex; animation: fadeSlideUp 0.5s cubic-bezier(0.25, 1, 0.5, 1) forwards; }
+    
+    .cards-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 20px; width: 100%; }
+    .card { background: var(--card-bg); border-radius: 24px; padding: 24px; box-shadow: 0 8px 30px rgba(0,0,0,0.04); }
+    
+    .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; min-height: 28px; }
+    .card-title { font-size: 17px; font-weight: 600; color: var(--text-main); }
+    
+    .status-badge { padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 800; letter-spacing: 0.5px; text-transform: uppercase; transition: background-color 0.4s ease, color 0.4s ease; }
+    
+    .main-value { font-size: 40px; font-weight: 700; text-align: left; margin: 5px 0 15px 0; letter-spacing: -1px; color: var(--text-main); }
+    
+    canvas { width: 100%; height: 120px; border-radius: 12px; margin-top: 10px; cursor: crosshair; border: 1px solid var(--border-color); transition: border-color 0.4s ease; }
+    
+    .stat-list { display: flex; flex-direction: column; gap: 15px; width: 100%; }
+    .stat-item { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--border-color); }
+    .stat-item:last-child { border-bottom: none; }
+    .stat-label { font-size: 15px; color: var(--text-muted); font-weight: 500; }
+    .stat-val { font-size: 17px; font-weight: 600; color: var(--text-main); }
+
+    #tooltip { position: absolute; display: none; background: var(--tooltip-bg); color: var(--tooltip-text); padding: 10px 14px; border-radius: 12px; font-size: 14px; pointer-events: none; z-index: 100; box-shadow: 0 10px 20px rgba(0,0,0,0.15); text-align: center; backdrop-filter: blur(5px); transition: background-color 0.4s ease, color 0.4s ease; }
+  </style>
+</head>
+<body class="light-theme">
+  <div class="title-container">
+    <h1>Метеостанція</h1>
+    <div class="theme-switch" onclick="toggleTheme()" id="theme-icon">🌙</div>
+  </div>
+  
+  <div class="tabs-container">
+    <div class="tabs">
+      <div class="tab-slider" id="tab-slider"></div>
+      <div class="tab active" onclick="openTab(event, 'tab-live')">Зараз</div>
+      <div class="tab" onclick="openTab(event, 'tab-hist')">Історія</div>
+      <div class="tab" onclick="openTab(event, 'tab-stat')">Статистика</div>
+    </div>
+  </div>
+
+  <div id="tooltip"></div>
+
+  <div id="tab-live" class="tab-content active">
+    <div class="cards-grid">
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">🌡️ Температура</span>
+          <div class="status-badge" id="t_s">--</div>
+        </div>
+        <div class="main-value" id="t_v">--</div>
+        <canvas id="c_t"></canvas>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">💧 Вологість</span>
+          <div class="status-badge" id="h_s">--</div>
+        </div>
+        <div class="main-value" id="h_v">--</div>
+        <canvas id="c_h"></canvas>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">⏲️ Тиск</span>
+        </div>
+        <div class="main-value" id="p_v">--</div>
+        <canvas id="c_p"></canvas>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">🌧️ Опади</span>
+          <div class="status-badge" id="r_s">--</div>
+        </div>
+        <div class="main-value" id="r_v">--</div>
+        <canvas id="c_r"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div id="tab-hist" class="tab-content">
+    <div class="cards-grid">
+      <div class="card"><div class="card-title" style="margin-bottom:15px;">Історія Температури🌡️</div><canvas id="hist_t"></canvas></div>
+      <div class="card"><div class="card-title" style="margin-bottom:15px;">Історія Вологості💧</div><canvas id="hist_h"></canvas></div>
+      <div class="card"><div class="card-title" style="margin-bottom:15px;">Історія Тиску⏲️</div><canvas id="hist_p"></canvas></div>
+      <div class="card"><div class="card-title" style="margin-bottom:15px;">Історія Опадів🌧️</div><canvas id="hist_r"></canvas></div>
+    </div>
+  </div>
+
+  <div id="tab-stat" class="tab-content">
+    <div class="cards-grid">
+      <div class="card">
+        <div class="card-title" style="margin-bottom: 20px;">🌡️ Температура</div>
+        <div class="stat-list">
+          <div class="stat-item"><span class="stat-label">Мінімум</span><span class="stat-val" style="color:#007aff" id="min_t">-- °C</span></div>
+          <div class="stat-item"><span class="stat-label">Середнє</span><span class="stat-val" id="avg_t">-- °C</span></div>
+          <div class="stat-item"><span class="stat-label">Максимум</span><span class="stat-val" style="color:#ff3b30" id="max_t">-- °C</span></div>
+        </div>
+      </div>
+      
+      <div class="card">
+        <div class="card-title" style="margin-bottom: 20px;">💧 Вологість</div>
+        <div class="stat-list">
+          <div class="stat-item"><span class="stat-label">Мінімум</span><span class="stat-val" style="color:#007aff" id="min_h">-- %</span></div>
+          <div class="stat-item"><span class="stat-label">Середнє</span><span class="stat-val" id="avg_h">-- %</span></div>
+          <div class="stat-item"><span class="stat-label">Максимум</span><span class="stat-val" style="color:#ff3b30" id="max_h">-- %</span></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title" style="margin-bottom: 20px;">⏲️ Тиск</div>
+        <div class="stat-list">
+          <div class="stat-item"><span class="stat-label">Мінімум</span><span class="stat-val" style="color:#007aff" id="min_p">-- mmHg</span></div>
+          <div class="stat-item"><span class="stat-label">Середнє</span><span class="stat-val" id="avg_p">-- mmHg</span></div>
+          <div class="stat-item"><span class="stat-label">Максимум</span><span class="stat-val" style="color:#ff3b30" id="max_p">-- mmHg</span></div>
+        </div>
+      </div>
+      
+      <div class="card">
+        <div class="card-title" style="margin-bottom: 20px;">🌧️ Опади</div>
+        <div class="stat-list">
+          <div class="stat-item"><span class="stat-label">Мінімум</span><span class="stat-val" style="color:#007aff" id="min_r">--</span></div>
+          <div class="stat-item"><span class="stat-label">Середнє</span><span class="stat-val" id="avg_r">--</span></div>
+          <div class="stat-item"><span class="stat-label">Максимум</span><span class="stat-val" style="color:#ff3b30" id="max_r">--</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    window.lastData = null;
+
+    function toggleTheme() {
+      const doc = document.documentElement;
+      const icon = document.getElementById('theme-icon');
+      if (doc.getAttribute('data-theme') === 'dark') {
+        doc.removeAttribute('data-theme');
+        icon.style.transform = 'rotate(0deg)';
+        setTimeout(() => icon.innerText = '🌙', 150);
+      } else {
+        doc.setAttribute('data-theme', 'dark');
+        icon.style.transform = 'rotate(180deg)';
+        setTimeout(() => icon.innerText = '☀️', 150);
+      }
+      
+      drawAllHistory();
+      if(window.lastData) renderStatuses(window.lastData);
+    }
+
+    window.onload = () => {
+       const activeTab = document.querySelector('.tab.active');
+       const slider = document.getElementById('tab-slider');
+       slider.style.width = activeTab.offsetWidth + 'px';
+       slider.style.transform = `translateX(${activeTab.offsetLeft - 4}px)`;
+    };
+
+    function openTab(evt, tabName) {
+      document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+      
+      document.getElementById(tabName).classList.add('active');
+      
+      const tab = evt.currentTarget;
+      tab.classList.add('active');
+      const slider = document.getElementById('tab-slider');
+      slider.style.width = tab.offsetWidth + 'px';
+      slider.style.transform = `translateX(${tab.offsetLeft - 4}px)`;
+    }
+
+    const liveData = { t:[], h:[], p:[], r:[], labels:[] };
+    let histDataCache = { t:[], h:[], p:[], r:[] };
+    const maxPoints = 15;
+    const tt = document.getElementById('tooltip');
+
+    function draw(id, data, labels, color, unit, pts, type) {
+      const cvs = document.getElementById(id);
+      cvs.width = cvs.offsetWidth; cvs.height = cvs.offsetHeight;
+      const ctx = cvs.getContext('2d'), w = cvs.width, h = cvs.height;
+      ctx.clearRect(0,0,w,h);
+      
+      let validData = [];
+      let validLabels = [];
+      data.forEach((v, i) => {
+          if (v > -500) {
+              validData.push(v);
+              if (labels && labels[i]) validLabels.push(labels[i]);
+          }
+      });
+
+      if (validData.length < 2) return;
+
+      let min = Math.min(...validData), max = Math.max(...validData);
+      if (min === max) { min -= 1; max += 1; }
+      const pad = (max - min) * 0.2; min -= pad; max += pad;
+      
+      const stepX = w / (pts - 1);
+      const getY = (v) => h - 20 - ((v - min) / (max - min)) * (h - 30);
+
+      ctx.beginPath();
+      validData.forEach((v, i) => { if(i==0) ctx.moveTo(i*stepX, getY(v)); else ctx.lineTo(i*stepX, getY(v)); });
+      ctx.strokeStyle = color; ctx.lineWidth = 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.stroke();
+      
+      let gradient = ctx.createLinearGradient(0, 0, 0, h);
+      gradient.addColorStop(0, color + '40'); 
+      gradient.addColorStop(1, color + '00'); 
+      ctx.lineTo((validData.length-1)*stepX, h); ctx.lineTo(0, h);
+      ctx.fillStyle = gradient; ctx.fill();
+
+      const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+      const dotColor = isDark ? '#1c1c1e' : '#ffffff';
+
+      validData.forEach((v, i) => {
+        const x = i * stepX, y = getY(v);
+        ctx.fillStyle = dotColor; ctx.beginPath(); ctx.arc(x, y, 4, 0, 7); ctx.fill();
+        ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.stroke();
+      });
+
+      cvs.onmousemove = (e) => {
+        const rect = cvs.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left, mouseY = e.clientY - rect.top;
+        let found = false;
+        
+        validData.forEach((v, i) => {
+          const pointX = i * stepX, pointY = getY(v);
+          
+          if(Math.sqrt(Math.pow(mouseX - pointX, 2) + Math.pow(mouseY - pointY, 2)) < 15) {
+            tt.style.display = 'block'; 
+            tt.style.left = e.pageX + 15 + 'px'; 
+            tt.style.top = e.pageY - 40 + 'px';
+            
+            let timeLabel = "";
+            if (labels && validLabels[i]) {
+              timeLabel = validLabels[i]; 
+            } else {
+              let pastTime = new Date();
+              let diff = validData.length - 1 - i;
+              pastTime.setMinutes(pastTime.getMinutes() - diff);
+              timeLabel = pastTime.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+            }
+
+            let desc = "";
+            if (type === 't') {
+              if (v < 5) desc = "Холодно"; else if (v < 18) desc = "Прохолодно"; else if (v < 27) desc = "Комфортно"; else desc = "Спекотно";
+            } else if (type === 'h') {
+              if (v < 35) desc = "Сухо"; else if (v < 65) desc = "Норма"; else desc = "Волого";
+            } else if (type === 'r') {
+              if (v < 100) desc = "Без опадів"; else if (v < 1500) desc = "Мряка"; else desc = "Дощ";
+            }
+            // Для 'p' (тиск) змінна desc залишається порожньою
+
+            let labelColor = isDark ? '#98989d' : '#86868b';
+            let descHtml = desc !== "" ? ' • ' + desc : "";
+            
+            tt.innerHTML = '<div style="font-size:12px; color:'+labelColor+'; margin-bottom:4px; text-transform:uppercase; font-weight:600;">' + timeLabel + descHtml + '</div><div style="font-size:18px; font-weight:700;">' + v.toFixed(1) + ' <span style="font-size:14px;font-weight:normal">' + unit + '</span></div>';
+            found = true;
+          }
+        });
+        if(!found) tt.style.display = 'none';
+      };
+      cvs.onmouseleave = () => { tt.style.display = 'none'; };
+    }
+
+    function updateStatus(id, val, type) {
+      let el = document.getElementById(id);
+      let txt = "", baseCol = "";
+      
+      if (type === 't') {
+        if (val < 5) { txt = "ХОЛОДНО"; baseCol = "#007aff"; }
+        else if (val < 18) { txt = "ПРОХОЛОДНО"; baseCol = "#5ac8fa"; }
+        else if (val < 27) { txt = "КОМФОРТНО"; baseCol = "#34c759"; }
+        else { txt = "СПЕКА"; baseCol = "#ff3b30"; }
+      } 
+      else if (type === 'h') {
+        if (val < 35) { txt = "СУХО"; baseCol = "#ff9500"; }
+        else if (val < 65) { txt = "НОРМАЛЬНО"; baseCol = "#34c759"; }
+        else { txt = "ВОЛОГО"; baseCol = "#007aff"; }
+      }
+      else if (type === 'r') {
+        if (val < 100) { txt = "СУХО"; baseCol = "#8e8e93"; }
+        else if (val < 1500) { txt = "МРЯКА"; baseCol = "#5ac8fa"; }
+        else { txt = "ДОЩ"; baseCol = "#007aff"; }
+      }
+      
+      el.innerText = txt;
+      el.style.color = baseCol;
+      
+      const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+      el.style.backgroundColor = isDark ? baseCol + "25" : baseCol + "15"; 
+    }
+
+    function renderStatuses(d) {
+        updateStatus('t_s', d.t, 't');
+        updateStatus('h_s', d.h, 'h');
+        updateStatus('r_s', d.r, 'r');
+        // Статус для тиску 'p_s' повністю прибрано
+    }
+
+    setInterval(() => {
+      fetch('/data').then(r => r.json()).then(d => {
+        window.lastData = d;
+        const now = new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'});
+        
+        document.getElementById('t_v').innerHTML = d.t.toFixed(1) + ' <span style="font-size:22px; font-weight:600; color:var(--text-muted)">°C</span>'; 
+        document.getElementById('h_v').innerHTML = d.h.toFixed(1) + ' <span style="font-size:22px; font-weight:600; color:var(--text-muted)">%</span>'; 
+        document.getElementById('p_v').innerHTML = d.p.toFixed(1) + ' <span style="font-size:22px; font-weight:600; color:var(--text-muted)">mmHg</span>'; 
+        document.getElementById('r_v').innerHTML = d.r + ' <span style="font-size:22px; font-weight:600; color:var(--text-muted)"></span>'; 
+        
+        renderStatuses(d);
+
+        document.getElementById('min_t').innerText = d.mt.toFixed(1) + ' °C'; document.getElementById('avg_t').innerText = d.at.toFixed(1) + ' °C'; document.getElementById('max_t').innerText = d.xt.toFixed(1) + ' °C';
+        document.getElementById('min_h').innerText = d.mh.toFixed(1) + ' %'; document.getElementById('avg_h').innerText = d.ah.toFixed(1) + ' %'; document.getElementById('max_h').innerText = d.xh.toFixed(1) + ' %';
+        document.getElementById('min_p').innerText = d.mp.toFixed(1) + ' mmHg'; document.getElementById('avg_p').innerText = d.ap.toFixed(1) + ' mmHg'; document.getElementById('max_p').innerText = d.xp.toFixed(1) + ' mmHg';
+        
+        document.getElementById('min_r').innerText = d.mr;
+        document.getElementById('avg_r').innerText = d.ar.toFixed(1);
+        document.getElementById('max_r').innerText = d.xr;
+
+        if(liveData.t.length >= maxPoints) { 
+          liveData.t.shift(); liveData.h.shift(); liveData.p.shift(); liveData.r.shift(); liveData.labels.shift(); 
+        }
+        liveData.t.push(d.t); liveData.h.push(d.h); liveData.p.push(d.p); liveData.r.push(d.r); liveData.labels.push(now);
+
+        draw('c_t', liveData.t, liveData.labels, '#ff3b30', '°C', maxPoints, 't'); 
+        draw('c_h', liveData.h, liveData.labels, '#007aff', '%', maxPoints, 'h');  
+        draw('c_p', liveData.p, liveData.labels, '#af52de', ' mmHg', maxPoints, 'p'); 
+        draw('c_r', liveData.r, liveData.labels, '#5ac8fa', '', maxPoints, 'r');   
+      });
+    }, 5000);
+
+    function drawAllHistory() {
+        if(histDataCache.t.length > 0) {
+            draw('hist_t', histDataCache.t, null, '#ff3b30', '°C', 24, 't');
+            draw('hist_h', histDataCache.h, null, '#007aff', '%', 24, 'h');
+            draw('hist_p', histDataCache.p, null, '#af52de', ' mmHg', 24, 'p');
+            draw('hist_r', histDataCache.r, null, '#5ac8fa', '', 24, 'r');
+        }
+    }
+
+    setInterval(() => {
+      fetch('/history').then(r => r.json()).then(d => {
+        histDataCache = d;
+        drawAllHistory();
+      });
+    }, 15000);
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// --- СЕРВЕРНІ ФУНКЦІЇ ---
+
+void handleRoot() { server.send(200, "text/html", index_html); }
+
+void handleData() {
+  float t = bme.readTemperature();
+  float h = bme.readHumidity();
+  float p = bme.readPressure() / 133.32F;
+  int r = getRain();
+  
+  float avgT = (countReads > 0) ? (sumT / countReads) : 0;
+  float avgH = (countReads > 0) ? (sumH / countReads) : 0;
+  float avgP = (countReads > 0) ? (sumP / countReads) : 0;
+  float avgR = (countReads > 0) ? (sumR / countReads) : 0;
+
+  char json[512];
+  snprintf(json, sizeof(json), 
+    "{\"t\":%.1f, \"h\":%.1f, \"p\":%.1f, \"r\":%d, \"mt\":%.1f, \"xt\":%.1f, \"at\":%.1f, \"mh\":%.1f, \"xh\":%.1f, \"ah\":%.1f, \"mp\":%.1f, \"xp\":%.1f, \"ap\":%.1f, \"mr\":%d, \"xr\":%d, \"ar\":%.1f}", 
+    t, h, p, r, minT, maxT, avgT, minH, maxH, avgH, minP, maxP, avgP, minR, maxR, avgR);
+  server.send(200, "application/json", json);
+}
+
+void handleHistory() {
+  char buff[1024]; 
+  int pos = snprintf(buff, sizeof(buff), "{\"t\":[");
+  for(int i=0; i<24; i++) pos += snprintf(buff+pos, sizeof(buff)-pos, "%.1f%s", histT[i], i<23?",":"");
+  
+  pos += snprintf(buff+pos, sizeof(buff)-pos, "],\"h\":[");
+  for(int i=0; i<24; i++) pos += snprintf(buff+pos, sizeof(buff)-pos, "%.1f%s", histH[i], i<23?",":"");
+  
+  pos += snprintf(buff+pos, sizeof(buff)-pos, "],\"p\":[");
+  for(int i=0; i<24; i++) pos += snprintf(buff+pos, sizeof(buff)-pos, "%.1f%s", histP[i], i<23?",":"");
+  
+  pos += snprintf(buff+pos, sizeof(buff)-pos, "],\"r\":[");
+  for(int i=0; i<24; i++) pos += snprintf(buff+pos, sizeof(buff)-pos, "%d%s", histR[i], i<23?",":"");
+  
+  snprintf(buff+pos, sizeof(buff)-pos, "]}");
+  
+  server.send(200, "application/json", buff);
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
+  Wire.begin(21, 22);
+  bme.begin(0x76, &Wire);
+
+  for(int i=0; i<24; i++) {
+    histT[i] = -999.0; histH[i] = -999.0; histP[i] = -999.0; histR[i] = -999;
+  }
+
+  WiFiManager wm;
+  
+  // === ДОДАНО: СКИДАННЯ НАЛАШТУВАНЬ WI-FI ===
+  wm.resetSettings(); 
+  
+  if (!wm.autoConnect("Meteo_Maksym_Setup")) {
+    Serial.println("[-] Помилка підключення. Перезавантаження...");
+    delay(3000);
+    ESP.restart();
+  }
+  
+  Serial.println("\n[+] WiFi OK! IP: " + WiFi.localIP().toString());
+
+  // === ДОДАНО: Синхронізація часу (Україна) ===
+  configTzTime("EET-2EEST,M3.5.0/3,M10.5.0/4", "pool.ntp.org", "time.nist.gov");
+  
+  // === ДОДАНО ДЛЯ FIREBASE (ПОЧАТОК) ===
+  config.database_url = DATABASE_URL;
+  config.signer.tokens.legacy_token = API_KEY; 
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  signupOK = true; 
+  // === ДОДАНО ДЛЯ FIREBASE (КІНЕЦЬ) ===
+
+  mqtt.setServer(mqtt_server, 1883);
+  
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.on("/history", handleHistory);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  if (!mqtt.connected()) {
+    if (mqtt.connect("ESP32_Maksym_Final")) mqtt.publish(t_state, "Online");
+  }
+  mqtt.loop();
+
+  unsigned long now = millis();
+
+  if (now - prevMillis > 5000) {
+    prevMillis = now;
+    
+    float t = bme.readTemperature();
+    float h = bme.readHumidity();
+    float p = bme.readPressure() / 133.32F;
+    int r = getRain();
+
+    if (!isnan(t) && !isnan(h) && !isnan(p)) { 
+      if (t < minT) minT = t; if (t > maxT) maxT = t; sumT += t;
+      if (h < minH) minH = h; if (h > maxH) maxH = h; sumH += h;
+      if (p < minP) minP = p; if (p > maxP) maxP = p; sumP += p;
+      if (r < minR) minR = r; if (r > maxR) maxR = r; sumR += r;
+      countReads++; 
+    }
+
+    if (r > 1000) digitalWrite(LED_PIN, HIGH); else digitalWrite(LED_PIN, LOW);
+    
+    Serial.printf("Temp: %.1fC | Hum: %.1f%% | Pres: %.1fmmHg | Rain: %d\n", t, h, p, r);
+
+    char payload[150];
+    snprintf(payload, sizeof(payload), "{\n  \"temp\": %.1f,\n  \"hum\": %.1f,\n  \"pres\": %.1f,\n  \"rain\": %d\n}", t, h, p, r);
+    mqtt.publish(t_telemetry, payload);
+
+    // === ДОДАНО: Відправка в Current кожні 5 секунд з часом ===
+    if (Firebase.ready() && signupOK) {
+      FirebaseJson json;
+      json.set("temp", t);
+      json.set("hum", h);
+      json.set("pres", p);
+      json.set("rain", r);
+      json.set("time", getTimeString()); // Додає поле time
+      
+      if (Firebase.RTDB.setJSON(&fbdo, "/MeteoStation/Current", &json)) {
+        Serial.println("[+] Firebase: Поточні дані оновлено");
+      }
+    }
+  }
+
+  if (now - prevHistMillis > 60000) { 
+    prevHistMillis = now;
+    
+    for(int i = 0; i < 23; i++) {
+      histT[i] = histT[i+1]; histH[i] = histH[i+1];
+      histP[i] = histP[i+1]; histR[i] = histR[i+1];
+    }
+    histT[23] = bme.readTemperature(); histH[23] = bme.readHumidity();
+    histP[23] = bme.readPressure() / 133.32F; histR[23] = getRain();
+
+    // === ДОДАНО ДЛЯ FIREBASE (ІСТОРІЯ З ЧАСОМ) ===
+    if (Firebase.ready() && signupOK) {
+      FirebaseJson json;
+      json.set("temp", histT[23]);
+      json.set("hum", histH[23]);
+      json.set("pres", histP[23]);
+      json.set("rain", histR[23]);
+      json.set("time", getTimeString());
+      
+      // Створюємо папку з назвою часу (наприклад, 18:09:05)
+      String path = "/MeteoStation/History/" + getTimeString();
+      
+      if (Firebase.RTDB.setJSON(&fbdo, path.c_str(), &json)) {
+        Serial.println("[+] Firebase: Дані додано до історії");
+      } else {
+        Serial.println("[-] Firebase Error (History): " + fbdo.errorReason());
+      }
+    }
+    // === ДОДАНО ДЛЯ FIREBASE (КІНЕЦЬ) ===
+  }
+}
